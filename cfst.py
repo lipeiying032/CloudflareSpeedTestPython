@@ -14,6 +14,7 @@ cfst.py — CloudflareSpeedTest Python 移植版
 """
 
 import argparse
+import concurrent.futures
 import csv
 import ipaddress
 import os
@@ -29,6 +30,23 @@ import urllib.error
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from urllib.parse import urlparse, urljoin
+
+# ──────────────────────────────────────────────
+# 平台线程限制检测
+# iOS (a-Shell / Pythonista 等) 进程级线程数上限约 64
+# 安全起见统一限制到 32（留余量给解释器自身线程）
+# ──────────────────────────────────────────────
+def _platform_max_routines() -> int:
+    # sys.platform == 'ios' 适用于 Pythonista；
+    # a-Shell 报告 'darwin' 但路径含 private/var/mobile
+    if sys.platform == "ios":
+        return 32
+    if sys.platform == "darwin" and (
+        "/var/mobile" in sys.executable or
+        "/var/mobile" in (os.environ.get("HOME", ""))
+    ):
+        return 32
+    return 1000   # 桌面 / 服务器平台不限制
 
 # ──────────────────────────────────────────────
 # 彩色输出（有 colorama 就用，否则降级为普通文本）
@@ -128,12 +146,13 @@ def load_ip_ranges(ip_file: str, ip_text: str, test_all: bool) -> List[str]:
     lines: List[str] = []
 
     if ip_text:
-        lines = [s.strip() for s in ip_text.split(",") if s.strip()]
+        import re as _re
+        lines = [s.strip() for s in _re.split(r"[,\n\r]+", ip_text) if s.strip()]
     else:
         if not ip_file:
             ip_file = "ip.txt"
         try:
-            with open(ip_file, "r", encoding="utf-8") as f:
+            with open(ip_file, "r", encoding="utf-8-sig") as f:
                 lines = [l.strip() for l in f if l.strip()]
         except FileNotFoundError:
             sys.exit(f"[错误] 找不到 IP 数据文件: {ip_file}")
@@ -449,10 +468,8 @@ def run_ping(
     results: List[IPResult] = []
     lock    = threading.Lock()
     bar     = Bar(len(ips), "可用:", "")
-    sem     = threading.Semaphore(routines)
-    threads = []
 
-    def worker(ip: str):
+    def worker(ip: str) -> None:
         try:
             if httping:
                 pd = do_httping(ip, url, port, ping_times, valid_codes, colo_filter, debug)
@@ -467,16 +484,13 @@ def run_ping(
                 now_able += 1
                 results.append(IPResult(ping=pd))
             bar.grow(1, str(now_able))
-        sem.release()
 
-    for ip in ips:
-        sem.acquire()
-        t = threading.Thread(target=worker, args=(ip,), daemon=True)
-        t.start()
-        threads.append(t)
-
-    for t in threads:
-        t.join()
+    # 使用线程池而非每 IP 单独创建线程
+    # ThreadPoolExecutor 维护固定数量的工作线程，任务通过队列分发
+    # 无论 IP 数量多少，OS 线程数始终 ≤ routines，不会触发 iOS 线程上限
+    with concurrent.futures.ThreadPoolExecutor(max_workers=routines) as pool:
+        futures = [pool.submit(worker, ip) for ip in ips]
+        concurrent.futures.wait(futures)
 
     bar.done()
     results.sort()
@@ -915,7 +929,11 @@ def main():
         sys.exit(0)
 
     # ── 参数校验 ──
-    routines   = max(1, min(args.n, 1000))
+    platform_max = _platform_max_routines()
+    routines     = max(1, min(args.n, platform_max))
+    if routines < args.n:
+        print(_yellow(f"[提示] 当前平台线程数上限为 {platform_max}，"
+                      f"-n 已自动调整为 {routines}（原设定 {args.n}）"))
     port       = args.tp if 0 < args.tp < 65535 else 443
     ping_times = max(1, args.t)
     dl_time    = max(1, args.dt)
